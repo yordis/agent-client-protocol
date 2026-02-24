@@ -1,0 +1,310 @@
+---
+title: "Error Retry Info"
+---
+
+## Elevator pitch
+
+> What are you proposing to change?
+
+We propose adding an optional `retryInfo` field to the JSON-RPC `Error` object, allowing agents to
+tell clients whether a failed request is transient and when to retry. This is analogous to the HTTP
+`Retry-After` header but designed for the ACP protocol.
+
+## Status quo
+
+> How do things work today and what problems does this cause?
+
+From the ACP client's perspective, an agent is a black box. When a request fails, the client
+receives an error with a `code` and `message`, but has no way to distinguish between permanent
+failures and transient ones.
+
+The agent, however, often knows exactly what went wrong and when the client can try again — it may
+be enforcing its own rate limits, managing concurrent session capacity, throttling based on
+subscription tiers, or experiencing temporary internal issues. Today the protocol gives the agent no
+structured way to communicate this to the client.
+
+This leaves clients with poor options:
+
+- **Blind retries with arbitrary backoff** — wasting resources on non-retryable errors and
+  potentially making things worse by retrying too aggressively
+- **No retries at all** — missing opportunities to recover from transient failures that the agent
+  knows will resolve shortly
+- **Ad-hoc conventions in the `data` field** — leading to fragmented implementations where every
+  agent/client pair invents its own retry signaling
+
+The [Session Usage RFD](./session-usage) explicitly noted that "rate limits and quotas are a
+separate concern that could be addressed in a future RFD."
+
+## What we propose to do about it
+
+We introduce three new types and one new field on the `Error` object:
+
+### New scalar types
+
+```typescript
+/**
+ * Timestamp represents a point in time using ISO 8601 format in UTC timezone.
+ *
+ * Note: Implementations should use native date/time types in their programming
+ * language (e.g., time.Time in Go, DateTime in C#, Date in JavaScript) and
+ * serialize to ISO 8601 strings for transport. For Protocol Buffers,
+ * use google.protobuf.Timestamp.
+ *
+ * Examples: "2023-01-01T12:30:45Z", "2023-01-01T12:30:45.123Z"
+ */
+type Timestamp = string;
+
+/**
+ * Duration represents a span of time using ISO 8601 duration format.
+ *
+ * Note: Implementations should use native duration types in their programming
+ * language (e.g., time.Duration in Go, TimeSpan in C#, number in JavaScript)
+ * and serialize to ISO 8601 duration strings for transport. For Protocol Buffers,
+ * use google.protobuf.Duration.
+ *
+ * Examples: "PT30S" (30 seconds), "PT5M" (5 minutes), "P1D" (1 day)
+ */
+type Duration = string;
+```
+
+### RetryInfo type
+
+```typescript
+type RetryDuration = {
+  /**
+   * Specifies a duration to wait before retrying the request.
+   */
+  retryOffset: Duration;
+};
+
+type RetryTime = {
+  /**
+   * Specifies an absolute timestamp after which to retry the request.
+   */
+  retryTime: Timestamp;
+};
+
+/**
+ * Describes when a client can retry a failed request, similar to the HTTP
+ * `Retry-After` header. It specifies either a duration to wait or an absolute
+ * timestamp after which to retry.
+ *
+ * Clients may ignore this information but are encouraged to follow it. When
+ * retrying, clients should use an exponential backoff strategy. If
+ * `retryOffset` is provided, it can serve as the initial backoff interval.
+ *
+ * Servers **MUST** set either `retryOffset` or `retryTime`—never both—to
+ * guide client backoff.
+ */
+type RetryInfo = RetryDuration | RetryTime;
+```
+
+### Updated Error object
+
+The `Error` object gains an optional `retryInfo` field:
+
+```typescript
+type Error = {
+  code: ErrorCode;
+  message: string;
+  data?: any;
+  retryInfo?: RetryInfo;
+};
+```
+
+### JSON Schema
+
+The following definitions would be added to the schema:
+
+```json
+{
+  "$defs": {
+    "Timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "A point in time using ISO 8601 format in UTC timezone.\n\nImplementations should use native date/time types in their programming language (e.g., time.Time in Go, DateTime in C#, Date in JavaScript) and serialize to ISO 8601 strings for transport. For Protocol Buffers, use google.protobuf.Timestamp.\n\nExamples: \"2023-01-01T12:30:45Z\", \"2023-01-01T12:30:45.123Z\""
+    },
+    "Duration": {
+      "type": "string",
+      "format": "duration",
+      "description": "A span of time using ISO 8601 duration format.\n\nImplementations should use native duration types in their programming language (e.g., time.Duration in Go, TimeSpan in C#, number in JavaScript) and serialize to ISO 8601 duration strings for transport. For Protocol Buffers, use google.protobuf.Duration.\n\nExamples: \"PT30S\" (30 seconds), \"PT5M\" (5 minutes), \"P1D\" (1 day)"
+    },
+    "RetryInfo": {
+      "description": "Describes when a client can retry a failed request, similar to the HTTP `Retry-After` header. It specifies either a duration to wait or an absolute timestamp after which to retry.\n\nClients may ignore this information but are encouraged to follow it. When retrying, clients should use an exponential backoff strategy. If `retryOffset` is provided, it can serve as the initial backoff interval.\n\nServers MUST set either `retryOffset` or `retryTime`—never both—to guide client backoff.",
+      "oneOf": [
+        {
+          "type": "object",
+          "title": "RetryDuration",
+          "description": "Retry after a relative duration.",
+          "properties": {
+            "retryOffset": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/Duration"
+                }
+              ],
+              "description": "Specifies a duration to wait before retrying the request."
+            }
+          },
+          "required": ["retryOffset"]
+        },
+        {
+          "type": "object",
+          "title": "RetryTime",
+          "description": "Retry after an absolute point in time.",
+          "properties": {
+            "retryTime": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/Timestamp"
+                }
+              ],
+              "description": "Specifies an absolute timestamp after which to retry the request."
+            }
+          },
+          "required": ["retryTime"]
+        }
+      ]
+    }
+  }
+}
+```
+
+The `Error` definition gains the optional `retryInfo` field:
+
+```json
+{
+  "Error": {
+    "description": "JSON-RPC error object.\n\nRepresents an error that occurred during method execution, following the JSON-RPC 2.0 error object specification with optional additional data.\n\nSee protocol docs: [JSON-RPC Error Object](https://www.jsonrpc.org/specification#error_object)",
+    "properties": {
+      "code": {
+        "allOf": [
+          {
+            "$ref": "#/$defs/ErrorCode"
+          }
+        ],
+        "description": "A number indicating the error type that occurred.\nThis must be an integer as defined in the JSON-RPC specification."
+      },
+      "message": {
+        "type": "string",
+        "description": "A string providing a short description of the error.\nThe message should be limited to a concise single sentence."
+      },
+      "data": {
+        "description": "Optional primitive or structured value that contains additional information about the error.\nThis may include debugging information or context-specific details."
+      },
+      "retryInfo": {
+        "allOf": [
+          {
+            "$ref": "#/$defs/RetryInfo"
+          }
+        ],
+        "description": "Optional retry information indicating that this error is transient and the request can be retried."
+      }
+    },
+    "required": ["code", "message"],
+    "type": "object"
+  }
+}
+```
+
+### Design decisions
+
+**`retryInfo` lives on the base `Error` object, not on a specific error code.** Multiple error
+types can be transient and retryable:
+
+- Internal errors (temporary server issues)
+- Upstream provider rate limiting or overload
+- Model temporarily unavailable
+- Resource temporarily locked
+
+Tying retry semantics to a single error code would force clients to special-case multiple codes
+or lose the ability to express "this was an internal error, but it's transient."
+
+**`RetryInfo` is a discriminated union using field presence.** Rather than a `type` discriminator
+field, the presence of `retryOffset` vs `retryTime` determines the variant. This keeps the
+payloads minimal and unambiguous since the two fields are mutually exclusive.
+
+**Duration uses ISO 8601 format.** While milliseconds integers are simpler, ISO 8601 durations
+(`PT30S`, `PT5M`) are a widely understood standard and align with Protocol Buffers' `Duration`
+type. This also keeps consistency with `Timestamp` which uses ISO 8601 as well.
+
+## Shiny future
+
+Once implemented, agents can communicate retry semantics alongside any error:
+
+**Rate limited with backoff hint:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32603,
+    "message": "Upstream provider rate limited",
+    "retryInfo": {
+      "retryOffset": "PT30S"
+    }
+  }
+}
+```
+
+**Quota reset at a specific time:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "error": {
+    "code": -32603,
+    "message": "Daily quota exceeded, resets at midnight UTC",
+    "retryInfo": {
+      "retryTime": "2026-02-25T00:00:00Z"
+    }
+  }
+}
+```
+
+**Non-retryable error (no retryInfo):**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "error": {
+    "code": -32602,
+    "message": "Invalid params"
+  }
+}
+```
+
+The presence of `retryInfo` on an error signals "this failure is transient." Its absence means
+"don't retry" or "the agent doesn't know when to retry."
+
+Clients are encouraged to respect `retryInfo` but may ignore it. When retrying, clients should
+use exponential backoff, optionally using `retryOffset` as the initial backoff interval.
+
+## Frequently asked questions
+
+### Why not a dedicated rate-limit error code?
+
+A dedicated error code (e.g., `-32001`) could complement `retryInfo` for cases where the *only*
+problem is "too many requests." However, `retryInfo` itself should not be gated on a specific
+error code since many different error types can be transient. A rate-limit error code could be
+added separately if needed.
+
+### Why not just use the `data` field?
+
+The `data` field is unstructured (`any`). Retry semantics benefit from a well-defined schema so
+that clients can implement retry logic without parsing arbitrary JSON. Making `retryInfo` a
+first-class field with a defined type enables consistent client behavior and better tooling
+support.
+
+### Why ISO 8601 durations instead of milliseconds?
+
+ISO 8601 durations are human-readable, widely supported, and consistent with the `Timestamp`
+format already used in the protocol. They also align naturally with Protocol Buffers' `Duration`
+type for implementations that use protobuf serialization.
+
+## Revision history
+
+- 2026-02-24: Initial draft
